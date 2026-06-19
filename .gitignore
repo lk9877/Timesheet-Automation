@@ -1,0 +1,9 @@
+node_modules/
+test-results/
+playwright-report/
+.env
+auth/*.json
+!auth/.gitkeep
+chrome-profile/
+users.json
+*.log

@@ -1,0 +1,27 @@
+{
+    "name": "timesheet-playwright-tests",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Playwright load and smoke tests for the Airtable Timesheet employee interface. Simulates 18-20 concurrent users.",
+    "scripts": {
+        "install:browsers": "playwright install chromium",
+        "capture-auth": "tsx scripts/capture-auth.ts",
+        "check-users": "tsx scripts/check-users.ts",
+        "load": "tsx scripts/run-load.ts",
+        "run:3x2": "cross-env PW_CONCURRENT_USERS=3 PW_ALLOW_REUSE=false PW_SOAK_MS=1000 tsx scripts/run-load.ts --mutate --records 2 --sequential",
+        "demo": "cross-env PW_HEADLESS=false PW_CONCURRENT_USERS=6 PW_ALLOW_REUSE=true PW_SOAK_MS=6000 tsx scripts/run-load.ts --mutate --remove --hours 0.25",
+        "demo:big": "cross-env PW_HEADLESS=true PW_CONCURRENT_USERS=20 PW_ALLOW_REUSE=true PW_SOAK_MS=2000 tsx scripts/run-load.ts --mutate --remove --hours 0.25 --stagger-ms 750",
+        "test": "playwright test",
+        "test:smoke": "playwright test tests/employee-smoke.spec.ts",
+        "test:concurrent": "playwright test tests/employee-concurrent.spec.ts",
+        "report": "playwright show-report"
+    },
+    "devDependencies": {
+        "@playwright/test": "^1.49.0",
+        "@types/node": "^22.9.0",
+        "cross-env": "^7.0.3",
+        "dotenv": "^16.4.5",
+        "tsx": "^4.19.2",
+        "typescript": "^5.6.3"
+    }
+}

@@ -1,0 +1,15 @@
+{
+    "_comment": "Copy this file to users.json and fill in real values. One entry per real Airtable account that should be used in the load test. The 'authState' path is relative to playwright_tests/ and is created by `npm run capture-auth -- --label <label>`.",
+    "users": [
+        {
+            "label": "employee01",
+            "email": "employee01@example.com",
+            "authState": "auth/employee01.json"
+        },
+        {
+            "label": "employee02",
+            "email": "employee02@example.com",
+            "authState": "auth/employee02.json"
+        }
+    ]
+}
