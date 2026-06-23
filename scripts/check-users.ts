@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import { chromium } from '@playwright/test';
 import { ENV } from '../lib/env';
 import { EmployeeInterfacePage } from '../lib/employeeInterface';
@@ -14,6 +15,14 @@ async function main(): Promise<void> {
 
     try {
         for (const user of pool) {
+            process.stdout.write(`\n${user.label} (${user.email})… `);
+            if (!fs.existsSync(user.authStatePath)) {
+                console.log('SKIP — auth not captured');
+                console.log(`  Run: npm run capture-auth -- --label ${user.label}`);
+                allOk = false;
+                continue;
+            }
+
             const context = await browser.newContext({
                 storageState: user.authStatePath,
                 viewport: { width: 1440, height: 900 },
@@ -21,7 +30,6 @@ async function main(): Promise<void> {
             const page = await context.newPage();
             const ui = new EmployeeInterfacePage(page);
 
-            process.stdout.write(`\n${user.label} (${user.email})… `);
             try {
                 await ui.gotoAndWaitReady(ENV.interfaceUrl());
                 const name = await ui.loggedInUser();

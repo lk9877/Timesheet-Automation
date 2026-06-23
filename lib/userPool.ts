@@ -52,6 +52,22 @@ function authStateExists(p: string): boolean {
  *   afternoon behaviour the team described, but won't produce N distinct Airtable
  *   *sessions* — see README for the trade-off.
  */
+/** Look up a pool user by label (throws if missing). */
+export function getUserByLabel(label: string): PoolUser {
+    const pool = loadUserPool();
+    const user = pool.find(u => u.label === label);
+    if (!user) {
+        const labels = pool.map(u => u.label).join(', ');
+        throw new Error(`Unknown user label "${label}". Available: ${labels}`);
+    }
+    if (!authStateExists(user.authStatePath)) {
+        throw new Error(
+            `Auth state missing for ${label}. Run "npm run capture-auth -- --label ${label}".`,
+        );
+    }
+    return user;
+}
+
 export function assignUsers(count: number, allowReuse: boolean): PoolUser[] {
     const pool = loadUserPool();
     const missing = pool.filter(u => !authStateExists(u.authStatePath));

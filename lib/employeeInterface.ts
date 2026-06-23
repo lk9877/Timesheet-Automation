@@ -1,5 +1,17 @@
 import { expect, type Locator, type Page, type Frame, type FrameLocator } from '@playwright/test';
 
+export type TaskSelection =
+    | { kind: 'non-project'; label: string }
+    | { kind: 'project'; project: string; task: string };
+
+export type WeekNavResult = {
+    found: boolean;
+    selection: TaskSelection | null;
+    taskKind: 'non-project' | 'project' | null;
+    weeksAdvanced: number;
+    direction: 'none' | 'forward' | 'backward';
+};
+
 /**
  * Page Object for the Airtable employee timesheet interface.
  *
@@ -122,11 +134,45 @@ export class EmployeeInterfacePage {
     async clickPrevWeek(): Promise<void> {
         const root = await this.resolveRoot();
         await (root as Page).getByRole('button', { name: 'Prev week' }).click();
+        await this.waitForWeekLoad();
     }
 
     async clickNextWeek(): Promise<void> {
         const root = await this.resolveRoot();
         await (root as Page).getByRole('button', { name: 'Next week' }).click();
+        await this.waitForWeekLoad();
+    }
+
+    private async isWeekNavEnabled(label: 'Prev week' | 'Next week'): Promise<boolean> {
+        const root = await this.resolveRoot();
+        const btn = (root as Page).getByRole('button', { name: label }).first();
+        if ((await btn.count()) === 0) return false;
+        const aria = await btn.getAttribute('aria-disabled');
+        const disabled = await btn.getAttribute('disabled');
+        return aria !== 'true' && disabled === null;
+    }
+
+    async isNextWeekEnabled(): Promise<boolean> {
+        return this.isWeekNavEnabled('Next week');
+    }
+
+    async isPrevWeekEnabled(): Promise<boolean> {
+        return this.isWeekNavEnabled('Prev week');
+    }
+
+    /** Brief pause after week navigation so dropdowns repopulate. */
+    async waitForWeekLoad(timeout = 10_000): Promise<void> {
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+            try {
+                const root = await this.resolveRoot();
+                await (root as Page).locator('h1', { hasText: /^Timesheet$/ }).waitFor({ state: 'visible', timeout: 1_000 });
+                await this.page.waitForTimeout(300);
+                return;
+            } catch {
+                await this.page.waitForTimeout(200);
+            }
+        }
     }
 
     async clickCopyLastWeek(): Promise<void> {
@@ -264,6 +310,90 @@ export class EmployeeInterfacePage {
             await this.page.keyboard.press('Escape').catch(() => {});
         }
         return result.picked;
+    }
+
+    /**
+     * Try to select a task for the current week (non-project first, then project).
+     * Returns the selection with dropdowns already filled, or null if nothing could
+     * be picked.
+     */
+    async trySelectTaskForAdd(): Promise<TaskSelection | null> {
+        const nonProject = await this.pickFirstNonProjectTask();
+        if (nonProject) return { kind: 'non-project', label: nonProject };
+
+        const project = await this.pickProject();
+        if (!project) return null;
+        const task = await this.pickFirstProjectTask();
+        if (!task) {
+            await this.page.keyboard.press('Escape').catch(() => {});
+            return null;
+        }
+        return { kind: 'project', project, task };
+    }
+
+    /** Project-based fallback when a non-project pick did not result in a new row. */
+    async trySelectProjectTaskForAdd(): Promise<Extract<TaskSelection, { kind: 'project' }> | null> {
+        const project = await this.pickProject();
+        if (!project) return null;
+        const task = await this.pickFirstProjectTask();
+        if (!task) {
+            await this.page.keyboard.press('Escape').catch(() => {});
+            return null;
+        }
+        return { kind: 'project', project, task };
+    }
+
+    private toWeekNavResult(
+        selection: TaskSelection | null,
+        weeksAdvanced: number,
+        direction: WeekNavResult['direction'],
+    ): WeekNavResult {
+        return {
+            found: selection != null,
+            selection,
+            taskKind: selection?.kind ?? null,
+            weeksAdvanced,
+            direction,
+        };
+    }
+
+    /**
+     * Walk forward through weeks, then backward from the starting week, until
+     * a task can actually be selected. The returned selection is already applied
+     * in the UI — callers should click Add task next.
+     */
+    async advanceToWeekWithAvailableTasks(opts?: {
+        maxForward?: number;
+        maxBackward?: number;
+    }): Promise<WeekNavResult> {
+        const maxForward = opts?.maxForward ?? 52;
+        const maxBackward = opts?.maxBackward ?? 52;
+
+        let selection = await this.trySelectTaskForAdd();
+        if (selection) return this.toWeekNavResult(selection, 0, 'none');
+
+        let forwardHops = 0;
+        for (let i = 0; i < maxForward; i++) {
+            if (!(await this.isNextWeekEnabled())) break;
+            await this.clickNextWeek();
+            forwardHops++;
+            selection = await this.trySelectTaskForAdd();
+            if (selection) return this.toWeekNavResult(selection, forwardHops, 'forward');
+        }
+
+        for (let i = 0; i < forwardHops; i++) {
+            if (!(await this.isPrevWeekEnabled())) break;
+            await this.clickPrevWeek();
+        }
+
+        for (let i = 0; i < maxBackward; i++) {
+            if (!(await this.isPrevWeekEnabled())) break;
+            await this.clickPrevWeek();
+            selection = await this.trySelectTaskForAdd();
+            if (selection) return this.toWeekNavResult(selection, i + 1, 'backward');
+        }
+
+        return this.toWeekNavResult(null, 0, 'none');
     }
 
     /** Same as pickFirstNonProjectTask but for the project-based task dropdown. */

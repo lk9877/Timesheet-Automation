@@ -6,4 +6,8 @@ auth/*.json
 !auth/.gitkeep
 chrome-profile/
 users.json
+users.*.json
+!users.example.json
 *.log
+.DS_Store
+Thumbs.db

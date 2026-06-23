@@ -1,0 +1,10 @@
+{
+    "_comment": "Same 3 users, 4 separate runs (not one combined run). Use: npm run run:3x15 | run:3x20 | run:3x6 | run:3x5",
+    "userLabels": ["user1", "user2", "user3"],
+    "runs": [
+        { "recordsPerUser": 15 },
+        { "recordsPerUser": 20 },
+        { "recordsPerUser": 6 },
+        { "recordsPerUser": 5 }
+    ]
+}

@@ -80,6 +80,11 @@ interface ScenarioOptions {
     actionTimeoutMs?: number;
 }
 
+export interface VuAssignment {
+    user: PoolUser;
+    recordCount: number;
+}
+
 async function runVirtualUser(
     browser: Browser,
     user: PoolUser,
@@ -87,6 +92,7 @@ async function runVirtualUser(
     interfaceUrl: string,
     soakMs: number,
     opts: ScenarioOptions,
+    recordCountOverride?: number,
 ): Promise<VirtualUserResult> {
     const startedAt = Date.now();
     const result: VirtualUserResult = {
@@ -165,9 +171,18 @@ async function runVirtualUser(
 
             await recordAction('preflightAddTask', async () => {
                 const displayName = await ui.loggedInUser();
+                const weekNav = await ui.advanceToWeekWithAvailableTasks();
+                if (weekNav.found && weekNav.weeksAdvanced > 0) {
+                    result.weekClickCount += weekNav.weeksAdvanced;
+                }
+                if (!weekNav.found || !weekNav.selection) {
+                    return { ok: false, detail: 'no task available in any scanned week' };
+                }
+                const picked =
+                    weekNav.selection.kind === 'non-project'
+                        ? weekNav.selection.label
+                        : weekNav.selection.task;
                 const before = await ui.taskRowCount();
-                const picked = await ui.pickFirstNonProjectTask();
-                if (!picked) return { ok: false, detail: 'no task available to pick' };
                 await ui.clickAddTask();
                 const after = await ui.waitForTaskAdded(before, 8_000);
                 const unsaved = await ui.hasUnsavedChanges();
@@ -203,42 +218,84 @@ async function runVirtualUser(
                 await page.waitForTimeout(800);
             }
 
-            const recordCount = Math.max(1, opts.mutationRecordCount ?? 1);
+            const recordCount = Math.max(1, recordCountOverride ?? opts.mutationRecordCount ?? 1);
             for (let rec = 0; rec < recordCount; rec++) {
                 const suffix = recordCount > 1 ? `#${rec + 1}` : '';
                 const cellDay = (dayIndex + rec) % 7;
 
-                await recordAction(`pickNonProjectTask${suffix}`, async () => {
-                    const label = await ui.pickFirstNonProjectTask();
-                    return label
-                        ? { ok: true, detail: `picked: ${label}` }
-                        : { ok: false, detail: 'no available non-project task to pick' };
+                const weekNav = await ui.advanceToWeekWithAvailableTasks();
+                if (weekNav.found && weekNav.weeksAdvanced > 0) {
+                    result.weekClickCount += weekNav.weeksAdvanced;
+                }
+
+                await recordAction(`ensureWeekHasTasks${suffix}`, async () => {
+                    if (!weekNav.found || !weekNav.selection) {
+                        return { ok: false, detail: 'exhausted week search — no selectable tasks' };
+                    }
+                    const hop =
+                        weekNav.weeksAdvanced > 0
+                            ? `, ${weekNav.direction} ${weekNav.weeksAdvanced} week(s)`
+                            : '';
+                    const detail =
+                        weekNav.selection.kind === 'non-project'
+                            ? `${weekNav.selection.label}${hop}`
+                            : `${weekNav.selection.project} / ${weekNav.selection.task}${hop}`;
+                    return { ok: true, detail };
                 });
+
+                if (!weekNav.found || !weekNav.selection) {
+                    throw new Error(`Record ${rec + 1}: no tasks available in any scanned week`);
+                }
 
                 let rowCountBefore = await ui.taskRowCount().catch(() => 0);
+                let usedProject = weekNav.selection.kind === 'project';
 
-                await recordAction(`clickAddTask${suffix}`, async () => {
-                    await ui.clickAddTask();
-                    return { ok: true };
-                });
+                if (!usedProject) {
+                    const sel = weekNav.selection;
+                    await recordAction(`pickNonProjectTask${suffix}`, async () => ({
+                        ok: true,
+                        detail: `picked: ${sel.kind === 'non-project' ? sel.label : ''}`,
+                    }));
 
-                let rowCountAfter = await ui.waitForTaskAdded(rowCountBefore);
-
-                if (rowCountAfter <= rowCountBefore && !(await ui.hasUnsavedChanges())) {
-                    await recordAction(`pickProjectTask${suffix}`, async () => {
-                        const project = await ui.pickProject();
-                        const task = await ui.pickFirstProjectTask();
-                        if (!project || !task) {
-                            return { ok: false, detail: `project=${project ?? 'none'} task=${task ?? 'none'}` };
-                        }
-                        return { ok: true, detail: `project=${project} task=${task}` };
+                    await recordAction(`clickAddTask${suffix}`, async () => {
+                        await ui.clickAddTask();
+                        return { ok: true };
                     });
-                    rowCountBefore = await ui.taskRowCount().catch(() => 0);
+                } else {
+                    const sel = weekNav.selection;
+                    await recordAction(`pickProjectTask${suffix}`, async () => ({
+                        ok: true,
+                        detail: `project=${sel.kind === 'project' ? sel.project : ''} task=${sel.kind === 'project' ? sel.task : ''}`,
+                    }));
                     await recordAction(`clickAddTaskProject${suffix}`, async () => {
                         await ui.clickAddTask();
                         return { ok: true };
                     });
-                    rowCountAfter = await ui.waitForTaskAdded(rowCountBefore);
+                }
+
+                let rowCountAfter = await ui.waitForTaskAdded(rowCountBefore);
+
+                if (!usedProject && rowCountAfter <= rowCountBefore && !(await ui.hasUnsavedChanges())) {
+                    const projectSel = await ui.trySelectProjectTaskForAdd();
+                    await recordAction(`pickProjectTask${suffix}`, async () => {
+                        if (!projectSel) {
+                            return { ok: false, detail: 'no project task available after non-project add failed' };
+                        }
+                        return { ok: true, detail: `project=${projectSel.project} task=${projectSel.task}` };
+                    });
+                    if (projectSel) {
+                        rowCountBefore = await ui.taskRowCount().catch(() => 0);
+                        await recordAction(`clickAddTaskProject${suffix}`, async () => {
+                            await ui.clickAddTask();
+                            return { ok: true };
+                        });
+                        rowCountAfter = await ui.waitForTaskAdded(rowCountBefore);
+                        usedProject = true;
+                    }
+                }
+
+                if (rowCountAfter <= rowCountBefore && !(await ui.hasUnsavedChanges())) {
+                    throw new Error(`Record ${rec + 1}: task row was not added after pick + click`);
                 }
 
                 const targetRow = Math.max(0, rowCountAfter - 1);
@@ -327,13 +384,13 @@ async function runVirtualUser(
     return result;
 }
 
-export async function runLoadTest(opts: ScenarioOptions = {}): Promise<LoadRunSummary> {
+async function executeLoadRun(
+    assignments: VuAssignment[],
+    soakMs: number,
+    opts: ScenarioOptions,
+): Promise<LoadRunSummary> {
     const interfaceUrl = ENV.interfaceUrl();
-    const concurrentUsers = ENV.concurrentUsers();
-    const soakMs = ENV.soakMs();
-    const allowReuse = ENV.allowReuse();
-
-    const assignment = assignUsers(concurrentUsers, allowReuse);
+    const concurrentUsers = assignments.length;
 
     fs.mkdirSync(path.resolve(ENV.repoRoot(), 'test-results'), { recursive: true });
 
@@ -351,12 +408,17 @@ export async function runLoadTest(opts: ScenarioOptions = {}): Promise<LoadRunSu
     try {
         if (opts.sequential) {
             results = [];
-            for (let i = 0; i < assignment.length; i++) {
-                results.push(await runVirtualUser(browser, assignment[i], i, interfaceUrl, soakMs, opts));
+            for (let i = 0; i < assignments.length; i++) {
+                const { user, recordCount } = assignments[i];
+                results.push(
+                    await runVirtualUser(browser, user, i, interfaceUrl, soakMs, opts, recordCount),
+                );
             }
         } else {
             results = await Promise.all(
-                assignment.map((user, i) => runVirtualUser(browser, user, i, interfaceUrl, soakMs, opts)),
+                assignments.map(({ user, recordCount }, i) =>
+                    runVirtualUser(browser, user, i, interfaceUrl, soakMs, opts, recordCount),
+                ),
             );
         }
     } finally {
@@ -388,6 +450,29 @@ export async function runLoadTest(opts: ScenarioOptions = {}): Promise<LoadRunSu
     const out = path.resolve(ENV.repoRoot(), 'test-results', `load-run-${Date.now()}.json`);
     fs.writeFileSync(out, JSON.stringify(summary, null, 2));
     return summary;
+}
+
+export async function runLoadTest(opts: ScenarioOptions = {}): Promise<LoadRunSummary> {
+    const concurrentUsers = ENV.concurrentUsers();
+    const soakMs = ENV.soakMs();
+    const allowReuse = ENV.allowReuse();
+    const recordCount = Math.max(1, opts.mutationRecordCount ?? 1);
+
+    const users = assignUsers(concurrentUsers, allowReuse);
+    const assignments: VuAssignment[] = users.map(user => ({ user, recordCount }));
+    return executeLoadRun(assignments, soakMs, opts);
+}
+
+/** Run a mixed scenario where each user may add a different number of task rows. */
+export async function runMixedLoadTest(
+    assignments: VuAssignment[],
+    opts: ScenarioOptions = {},
+): Promise<LoadRunSummary> {
+    if (assignments.length === 0) {
+        throw new Error('runMixedLoadTest requires at least one user assignment.');
+    }
+    const soakMs = ENV.soakMs();
+    return executeLoadRun(assignments, soakMs, { exerciseMutations: true, ...opts });
 }
 
 export function formatSummary(s: LoadRunSummary): string {
