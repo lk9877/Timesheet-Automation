@@ -2,26 +2,26 @@ import * as fs from 'node:fs';
 import { chromium } from '@playwright/test';
 import { ENV } from '../lib/env';
 import { EmployeeInterfacePage } from '../lib/employeeInterface';
-import { loadUserPool } from '../lib/userPool';
+import { loadUsersWithAuth } from '../lib/userPool';
 
 /**
- * Verify every user in users.json can log in and add a task.
- * Run before `npm run run:3x2` to catch Users-table setup issues early.
+ * Verify every user with captured auth can log in and add a task.
+ * Uses the same task-picking flow as the scenario runner.
  */
 async function main(): Promise<void> {
-    const pool = loadUserPool();
+    const pool = loadUsersWithAuth();
+    if (pool.length === 0) {
+        console.log('No users with auth. Run: npm run capture-auth -- --label user1');
+        process.exit(1);
+    }
+
     const browser = await chromium.launch({ channel: ENV.browserChannel(), headless: ENV.headless() });
     let allOk = true;
+    let okCount = 0;
 
     try {
         for (const user of pool) {
             process.stdout.write(`\n${user.label} (${user.email})… `);
-            if (!fs.existsSync(user.authStatePath)) {
-                console.log('SKIP — auth not captured');
-                console.log(`  Run: npm run capture-auth -- --label ${user.label}`);
-                allOk = false;
-                continue;
-            }
 
             const context = await browser.newContext({
                 storageState: user.authStatePath,
@@ -33,31 +33,47 @@ async function main(): Promise<void> {
             try {
                 await ui.gotoAndWaitReady(ENV.interfaceUrl());
                 const name = await ui.loggedInUser();
-                const before = await ui.taskRowCount();
-                const picked = await ui.pickFirstNonProjectTask();
-                if (!picked) {
-                    console.log('FAIL — no task to pick');
+                if (!name) {
+                    console.log('FAIL — not logged in (auth expired?)');
+                    console.log(`  Re-capture: npm run capture-auth -- --label ${user.label}`);
                     allOk = false;
                     continue;
                 }
+
+                await ui.selectTimesheetUserIfNeeded(name);
+                const weekNav = await ui.advanceToWeekWithAvailableTasks({ maxForward: 4, maxBackward: 4 });
+                if (!weekNav.found || !weekNav.selection) {
+                    console.log(`FAIL — no selectable task (logged in as "${name}")`);
+                    allOk = false;
+                    continue;
+                }
+
+                const picked =
+                    weekNav.selection.kind === 'non-project'
+                        ? weekNav.selection.label
+                        : `${weekNav.selection.project} / ${weekNav.selection.task}`;
+
+                const before = await ui.taskRowCount();
                 await ui.clickAddTask();
                 const after = await ui.waitForTaskAdded(before, 8_000);
                 const unsaved = await ui.hasUnsavedChanges();
                 if (after > before || unsaved) {
-                    console.log(`OK — logged in as "${name ?? '?'}", can add tasks`);
+                    okCount++;
+                    console.log(`OK — logged in as "${name}", picked "${picked}"`);
                 } else {
                     const alerts = await ui.getAlertMessages();
                     const banner = alerts.find(m => /cannot add task|users table/i.test(m));
-                    console.log('FAIL');
+                    console.log('FAIL — add did not create a row');
                     if (banner) console.log(`  UI: ${banner}`);
-                    console.log(
-                        `  Fix: In Airtable → Users Table, add a row with email "${user.email}" (must match login exactly).`,
-                    );
                     allOk = false;
                 }
             } catch (err) {
                 console.log('FAIL');
-                console.log(`  ${err instanceof Error ? err.message : String(err)}`);
+                const msg = err instanceof Error ? err.message : String(err);
+                console.log(`  ${msg.replace(/\s+/g, ' ').slice(0, 200)}`);
+                if (/auth|login|logged out/i.test(msg)) {
+                    console.log(`  Re-capture: npm run capture-auth -- --label ${user.label}`);
+                }
                 allOk = false;
             } finally {
                 await context.close();
@@ -68,6 +84,7 @@ async function main(): Promise<void> {
     }
 
     console.log('');
+    console.log(`Ready: ${okCount}/${pool.length} user(s) can add tasks`);
     if (!allOk) process.exit(1);
 }
 

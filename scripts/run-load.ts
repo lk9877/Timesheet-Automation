@@ -29,6 +29,16 @@ async function main(): Promise<void> {
     const recordsArg = args.indexOf('--records');
     const mutationRecordCount = recordsArg >= 0 && args[recordsArg + 1] ? Number(args[recordsArg + 1]) : 1;
 
+    const minWeekArg = args.indexOf('--tasks-per-week-min');
+    const mutationTasksPerWeekMin =
+        minWeekArg >= 0 && args[minWeekArg + 1] ? Number(args[minWeekArg + 1]) : 9;
+
+    const maxWeekArg = args.indexOf('--tasks-per-week-max');
+    const mutationTasksPerWeekMax =
+        maxWeekArg >= 0 && args[maxWeekArg + 1] ? Number(args[maxWeekArg + 1]) : 10;
+
+    const mutationFillAllDays = !args.includes('--single-day');
+
     const summary = await runLoadTest({
         exerciseWeekNav,
         exerciseMutations,
@@ -37,6 +47,9 @@ async function main(): Promise<void> {
         mutationTryRemove,
         mutationTryCopyLastWeek,
         mutationRecordCount,
+        mutationTasksPerWeekMin,
+        mutationTasksPerWeekMax,
+        mutationFillAllDays,
         sequential,
         staggerMs,
         navigationTimeoutMs,

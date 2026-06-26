@@ -43,6 +43,16 @@ function authStateExists(p: string): boolean {
     }
 }
 
+/** Users from the pool whose auth JSON file exists on disk. */
+export function loadUsersWithAuth(): PoolUser[] {
+    return loadUserPool().filter(u => authStateExists(u.authStatePath));
+}
+
+/** Count of users ready to run (auth captured). */
+export function countUsersWithAuth(): number {
+    return loadUsersWithAuth().length;
+}
+
 /**
  * Build the assignment of (virtual user index) -> (PoolUser) for a load run.
  *

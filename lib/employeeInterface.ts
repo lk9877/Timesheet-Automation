@@ -238,70 +238,168 @@ export class EmployeeInterfacePage {
      * label that was picked, or null if nothing was available.
      */
     async pickFirstNonProjectTask(match?: string): Promise<string | null> {
-        return this.pickFromDropdown('Select non-project based task', match);
+        return this.pickFromDropdown(
+            [
+                'Select non-project based task',
+                'Non-project based',
+                'Search non-project based tasks',
+            ],
+            match,
+        );
     }
 
     /**
-     * Generic helper: open a SearchDropdown by its trigger aria-label and
-     * pick the first option (optionally filtered by a substring).
-     *
-     * The dropdown's popover is portal'd into the iframe body via createPortal
-     * with class containing `z-[9999]`. We use a tiny DOM script to find the
-     * popover and click the first non-disabled option button — this is much
-     * more robust than locator hunting because Playwright doesn't have a
-     * stable ARIA relationship between the trigger and the option list.
+     * Pick from the unified project-task search (single dropdown listing
+     * "Project - Role | Project" style options).
      */
-    private async pickFromDropdown(triggerAriaLabel: string, match?: string): Promise<string | null> {
+    async pickCombinedProjectTask(match?: string): Promise<string | null> {
+        return this.pickFromDropdown(
+            [
+                'Select project task',
+                'Search tasks across all projects',
+                'Project based',
+            ],
+            match,
+        );
+    }
+
+    private async findDropdownTrigger(root: Page | Frame, candidates: string[]): Promise<Locator | null> {
+        for (const label of candidates) {
+            const exact = root.getByRole('button', { name: label }).first();
+            if ((await exact.count()) > 0) return exact;
+
+            const partial = root.getByRole('button', { name: new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first();
+            if ((await partial.count()) > 0) return partial;
+        }
+
+        for (const hint of candidates) {
+            const placeholder = root.getByPlaceholder(new RegExp(hint.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')).first();
+            if ((await placeholder.count()) > 0) {
+                const parentBtn = placeholder.locator('xpath=ancestor::button[1]');
+                if ((await parentBtn.count()) > 0) return parentBtn;
+                return placeholder;
+            }
+        }
+        return null;
+    }
+
+    /** Wait until at least one task picker trigger is on screen (lists load async). */
+    async waitForTaskPickersReady(timeout = 20_000): Promise<void> {
+        const labels = [
+            'non-project',
+            'project task',
+            'tasks across all projects',
+            'Select project',
+        ];
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+            const root = await this.resolveRoot();
+            for (const label of labels) {
+                const trigger = await this.findDropdownTrigger(root, [label]);
+                if (trigger) return;
+            }
+            await this.page.waitForTimeout(400);
+        }
+    }
+
+    /**
+     * Generic helper: open a SearchDropdown and pick the first option
+     * (optionally filtered by a substring).
+     */
+    private async pickFromDropdown(triggerLabels: string | string[], match?: string): Promise<string | null> {
+        const labels = Array.isArray(triggerLabels) ? triggerLabels : [triggerLabels];
         const debug = process.env.PW_DEBUG_MUTATIONS === '1';
         const log = (msg: string): void => {
-            if (debug) console.log(`[pickFromDropdown:${triggerAriaLabel}] ${msg}`);
+            if (debug) console.log(`[pickFromDropdown:${labels[0]}] ${msg}`);
         };
 
         const root = await this.resolveRoot();
         log('root resolved');
 
-        const trigger = root.getByRole('button', { name: triggerAriaLabel }).first();
-        const triggerCount = await trigger.count();
-        log(`trigger count = ${triggerCount}`);
-        if (triggerCount === 0) return null;
+        const trigger = await this.findDropdownTrigger(root, labels);
+        if (!trigger) {
+            log(`no trigger matched: ${labels.join(' | ')}`);
+            return null;
+        }
 
         await trigger.scrollIntoViewIfNeeded().catch(() => {});
         await trigger.click();
         log('trigger clicked');
 
-        const searchInput = root.locator('input[aria-label="Search options"]').first();
+        const searchInput = root.locator('input[aria-label="Search options"], input[placeholder*="Search"]').first();
         try {
-            await searchInput.waitFor({ state: 'visible', timeout: 5_000 });
+            await searchInput.waitFor({ state: 'visible', timeout: 8_000 });
             log('search input visible');
         } catch {
             log('search input NOT visible (popover did not open)');
+            await this.page.keyboard.press('Escape').catch(() => {});
             return null;
         }
 
         if (match) {
             await searchInput.fill(match);
-            await this.page.waitForTimeout(150);
+            await this.page.waitForTimeout(300);
             log(`search filled: ${match}`);
+        } else {
+            // Let async task lists finish loading (can be thousands of rows).
+            await this.page.waitForTimeout(600);
         }
 
         const result = await root.evaluate((matchTxt: string | null) => {
-            const search = document.querySelector('input[aria-label="Search options"]') as HTMLInputElement | null;
-            if (!search) return { picked: null as string | null, reason: 'no search input in DOM' };
-            let popover: Element | null = search.parentElement;
-            while (popover && !(popover.className && typeof popover.className === 'string' && popover.className.includes('z-[9999]'))) {
-                popover = popover.parentElement;
+            const matchLower = matchTxt ? matchTxt.toLowerCase() : null;
+
+            const options = Array.from(document.querySelectorAll('[role="option"]'));
+            for (let i = 0; i < options.length; i++) {
+                const opt = options[i]!;
+                if (opt.getAttribute('aria-disabled') === 'true') continue;
+                const text = (opt.textContent || '').trim();
+                if (!text || text.length >= 300 || /^search$/i.test(text)) continue;
+                if (matchLower && !text.toLowerCase().includes(matchLower)) continue;
+                (opt as HTMLElement).click();
+                return { picked: text, reason: 'role=option' };
             }
-            if (!popover) return { picked: null, reason: 'no popover ancestor with z-[9999]' };
-            const buttons = Array.from(popover.querySelectorAll('button:not([disabled])')) as HTMLButtonElement[];
-            if (buttons.length === 0) return { picked: null, reason: 'popover has zero non-disabled buttons' };
-            for (const btn of buttons) {
-                const text = (btn.textContent || '').trim();
-                if (!text || text.length > 200) continue;
-                if (matchTxt && !text.toLowerCase().includes(matchTxt.toLowerCase())) continue;
-                btn.click();
-                return { picked: text, reason: 'clicked' };
+
+            const search =
+                (document.querySelector('input[aria-label="Search options"]') as HTMLInputElement | null) ??
+                (document.querySelector('input[placeholder*="Search"]') as HTMLInputElement | null);
+
+            if (search) {
+                let popover: Element | null = search.parentElement;
+                while (popover && popover !== document.body) {
+                    const cls = typeof popover.className === 'string' ? popover.className : '';
+                    if (cls.includes('z-[9999]') || popover.getAttribute('role') === 'listbox') break;
+                    popover = popover.parentElement;
+                }
+                if (popover) {
+                    const buttons = Array.from(popover.querySelectorAll('button:not([disabled])'));
+                    for (let i = 0; i < buttons.length; i++) {
+                        const btn = buttons[i]!;
+                        if (btn.contains(search)) continue;
+                        const text = (btn.textContent || '').trim();
+                        if (!text || text.length >= 300 || /^search$/i.test(text)) continue;
+                        if (matchLower && !text.toLowerCase().includes(matchLower)) continue;
+                        (btn as HTMLElement).click();
+                        return { picked: text, reason: 'popover buttons' };
+                    }
+                }
+
+                let container: Element | null = search.parentElement;
+                for (let depth = 0; depth < 12 && container; depth++) {
+                    const buttons = Array.from(container.querySelectorAll('button:not([disabled])'));
+                    for (let i = 0; i < buttons.length; i++) {
+                        const btn = buttons[i]!;
+                        if (btn.contains(search)) continue;
+                        const text = (btn.textContent || '').trim();
+                        if (!text || text.length >= 300 || /^search$/i.test(text)) continue;
+                        if (matchLower && !text.toLowerCase().includes(matchLower)) continue;
+                        (btn as HTMLElement).click();
+                        return { picked: text, reason: 'ancestor buttons depth ' + depth };
+                    }
+                    container = container.parentElement;
+                }
             }
-            return { picked: null, reason: `no button matched (${buttons.length} candidates)` };
+
+            return { picked: null as string | null, reason: 'no matching option found' };
         }, match ?? null);
 
         log(`evaluate result: ${JSON.stringify(result)}`);
@@ -318,8 +416,18 @@ export class EmployeeInterfacePage {
      * be picked.
      */
     async trySelectTaskForAdd(): Promise<TaskSelection | null> {
+        await this.waitForTaskPickersReady();
+
         const nonProject = await this.pickFirstNonProjectTask();
         if (nonProject) return { kind: 'non-project', label: nonProject };
+
+        const combined = await this.pickCombinedProjectTask();
+        if (combined) {
+            const parts = combined.split('|').map(s => s.trim());
+            const project = parts.length > 1 ? parts[parts.length - 1]! : combined;
+            const task = parts.length > 1 ? parts.slice(0, -1).join('|').trim() : combined;
+            return { kind: 'project', project, task };
+        }
 
         const project = await this.pickProject();
         if (!project) return null;
@@ -366,8 +474,10 @@ export class EmployeeInterfacePage {
         maxForward?: number;
         maxBackward?: number;
     }): Promise<WeekNavResult> {
-        const maxForward = opts?.maxForward ?? 52;
-        const maxBackward = opts?.maxBackward ?? 52;
+        const maxForward = opts?.maxForward ?? 8;
+        const maxBackward = opts?.maxBackward ?? 8;
+
+        await this.waitForTaskPickersReady();
 
         let selection = await this.trySelectTaskForAdd();
         if (selection) return this.toWeekNavResult(selection, 0, 'none');
@@ -398,20 +508,31 @@ export class EmployeeInterfacePage {
 
     /** Same as pickFirstNonProjectTask but for the project-based task dropdown. */
     async pickFirstProjectTask(match?: string): Promise<string | null> {
-        return this.pickFromDropdown('Select project task', match);
+        return this.pickFromDropdown(['Select project task', 'Search tasks across all projects'], match);
     }
 
     /** Pick a project from the Project dropdown. */
     async pickProject(match?: string): Promise<string | null> {
-        return this.pickFromDropdown('Select project', match);
+        return this.pickFromDropdown(['Select project', 'Search projects'], match);
     }
 
-    /** Click the "Add task" button. Throws if it's disabled. */
+    /** Click the "Add task" button. Waits for it to become enabled after task selection. */
     async clickAddTask(): Promise<void> {
         const root = (await this.resolveRoot()) as Page;
         const btn = root.getByRole('button', { name: /^Add task$/ }).first();
-        await expect(btn).toBeEnabled({ timeout: 10_000 });
-        await btn.click();
+        const deadline = Date.now() + 15_000;
+        while (Date.now() < deadline) {
+            const disabled = await btn.getAttribute('disabled');
+            const aria = await btn.getAttribute('aria-disabled');
+            if (disabled === null && aria !== 'true') {
+                await btn.click();
+                return;
+            }
+            await this.page.waitForTimeout(300);
+        }
+        const alerts = await this.getAlertMessages();
+        const hint = alerts.length > 0 ? alerts.join('; ') : 'no task selected or week is read-only';
+        throw new Error(`Add task button stayed disabled — ${hint}`);
     }
 
     /** Number of weekly task rows currently in the grid. */
@@ -486,6 +607,15 @@ export class EmployeeInterfacePage {
         return true;
     }
 
+    /** Fill Monday–Sunday (dayIndex 0–6) for one task row. Returns how many cells were filled. */
+    async fillRowHoursAllDays(rowIndex: number, value: string): Promise<number> {
+        let filled = 0;
+        for (let day = 0; day < 7; day++) {
+            if (await this.fillCellHours(rowIndex, day, value)) filled++;
+        }
+        return filled;
+    }
+
     /** Click "Remove" on a specific row. Returns false if the button is disabled. */
     async clickRemoveOnRow(rowIndex: number): Promise<boolean> {
         const root = (await this.resolveRoot()) as Page;
@@ -557,6 +687,105 @@ export class EmployeeInterfacePage {
         const strong = root.locator('p:has-text("Logged in as:") strong').first();
         if ((await strong.count()) === 0) return null;
         return (await strong.innerText().catch(() => '')).trim() || null;
+    }
+
+    /**
+     * Admin/manager interfaces expose a "User" dropdown to pick whose timesheet
+     * to edit. If present, open it and select an option matching `hint` (name,
+     * email fragment, or pool label). No-op when the control is absent.
+     */
+    async selectTimesheetUserIfNeeded(hint: string): Promise<boolean> {
+        const root = await this.resolveRoot();
+        const triggers = [
+            root.getByRole('button', { name: /^Select user$/i }),
+            root.getByRole('button', { name: /Select user/i }),
+            root.locator('label:has-text("User")').locator('xpath=following::button[1]'),
+            root.locator('text=User').locator('xpath=following::button[1]'),
+        ];
+
+        let trigger: Locator | null = null;
+        for (const t of triggers) {
+            if ((await t.count()) > 0) {
+                trigger = t.first();
+                break;
+            }
+        }
+        if (!trigger) return false;
+
+        const disabled = await trigger.getAttribute('disabled');
+        const ariaDisabled = await trigger.getAttribute('aria-disabled');
+        if (disabled !== null || ariaDisabled === 'true') {
+            return false;
+        }
+
+        const current = ((await trigger.innerText().catch(() => '')) || '').trim();
+        if (current && hint && current.toLowerCase().includes(hint.toLowerCase())) return true;
+
+        await trigger.scrollIntoViewIfNeeded().catch(() => {});
+        await trigger.click();
+
+        const searchInput = root.locator('input[aria-label="Search options"], input[placeholder*="Search"]').first();
+        await searchInput.waitFor({ state: 'visible', timeout: 5_000 }).catch(() => {});
+
+        const picked = await root.evaluate((hintTxt: string) => {
+            const hintNorm = hintTxt.trim().toLowerCase();
+
+            const options = Array.from(document.querySelectorAll('[role="option"]'));
+            for (let i = 0; i < options.length; i++) {
+                const opt = options[i]!;
+                if (opt.getAttribute('aria-disabled') === 'true') continue;
+                const text = (opt.textContent || '').trim();
+                if (!text || text.length > 200) continue;
+                const textNorm = text.toLowerCase();
+                if (!hintNorm || textNorm.includes(hintNorm) || hintNorm.includes(textNorm)) {
+                    (opt as HTMLElement).click();
+                    return true;
+                }
+            }
+
+            const search = document.querySelector('input[aria-label="Search options"], input[placeholder*="Search"]');
+            if (search) {
+                let container: Element | null = search.parentElement;
+                for (let depth = 0; depth < 12 && container; depth++) {
+                    const buttons = Array.from(container.querySelectorAll('button:not([disabled])'));
+                    for (let j = 0; j < buttons.length; j++) {
+                        const btn = buttons[j]!;
+                        if (btn.contains(search)) continue;
+                        const text = (btn.textContent || '').trim();
+                        if (!text || text.length > 200) continue;
+                        const textNorm = text.toLowerCase();
+                        if (!hintNorm || textNorm.includes(hintNorm) || hintNorm.includes(textNorm)) {
+                            (btn as HTMLElement).click();
+                            return true;
+                        }
+                    }
+                    container = container.parentElement;
+                }
+            }
+            return false;
+        }, hint);
+
+        if (!picked) {
+            // Fall back to first selectable user so tasks can load.
+            const fallback = await root.evaluate(() => {
+                for (const opt of Array.from(document.querySelectorAll('[role="option"]'))) {
+                    if (opt.getAttribute('aria-disabled') === 'true') continue;
+                    const text = (opt.textContent || '').trim();
+                    if (text && text.length < 200) {
+                        (opt as HTMLElement).click();
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (!fallback) {
+                await this.page.keyboard.press('Escape').catch(() => {});
+                return false;
+            }
+        }
+
+        await this.page.waitForTimeout(500);
+        return true;
     }
 
     /** Pink/red alert banners shown above the timesheet grid (errors, warnings). */

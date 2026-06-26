@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { formatSummary, runMixedLoadTest, type VuAssignment } from '../lib/loadHarness';
+import { formatSummary, runMixedLoadTest, splitIntoWeeklyBatches, type VuAssignment } from '../lib/loadHarness';
 import { ENV } from '../lib/env';
 import { getUserByLabel, loadUserPool } from '../lib/userPool';
 
@@ -82,8 +82,11 @@ export function validateScenario(scenario: ScenarioFile): { ok: boolean; message
             const totalRecords = flat.reduce((sum, a) => sum + a.records, 0);
             messages.push(`Users: ${flat.length}, total task rows to add: ${totalRecords}`);
             messages.push('');
-            messages.push('Per-user plan:');
-            for (const a of flat) messages.push(`  ${a.label}: ${a.records} records`);
+            messages.push('Per-user plan (9–10 tasks/week, Mon–Sun hours filled):');
+            for (const a of flat) {
+                const weeks = splitIntoWeeklyBatches(a.records);
+                messages.push(`  ${a.label}: ${a.records} records → weeks [${weeks.join(', ')}]`);
+            }
         }
 
         const pool = loadUserPool();
@@ -158,6 +161,9 @@ async function main(): Promise<void> {
         sequential,
         staggerMs,
         mutationHoursValue,
+        mutationFillAllDays: true,
+        mutationTasksPerWeekMin: 9,
+        mutationTasksPerWeekMax: 10,
     });
     process.stdout.write(formatSummary(summary));
 

@@ -49,6 +49,30 @@ function percentile(values: number[], p: number): number | null {
     return sorted[idx];
 }
 
+/** Split total task count into weekly batches of 9–10 (last week may be smaller). */
+export function splitIntoWeeklyBatches(
+    total: number,
+    minPerWeek = 9,
+    maxPerWeek = 10,
+): number[] {
+    if (total <= 0) return [];
+    if (total <= maxPerWeek) return [total];
+
+    const batches: number[] = [];
+    let remaining = total;
+    while (remaining > 0) {
+        if (remaining <= maxPerWeek) {
+            batches.push(remaining);
+            break;
+        }
+        const weeksNeeded = Math.ceil(remaining / maxPerWeek);
+        const size = Math.min(maxPerWeek, Math.max(minPerWeek, Math.ceil(remaining / weeksNeeded)));
+        batches.push(Math.min(size, remaining));
+        remaining -= batches[batches.length - 1]!;
+    }
+    return batches;
+}
+
 interface ScenarioOptions {
     /**
      * If true, virtual users will navigate weeks (Prev / Next) during the soak
@@ -70,6 +94,12 @@ interface ScenarioOptions {
     mutationTryCopyLastWeek?: boolean;
     /** How many task rows to add + save per virtual user when exerciseMutations is true. Default 1. */
     mutationRecordCount?: number;
+    /** Min tasks to add per week before advancing (default 8). Only applies when record count exceeds max. */
+    mutationTasksPerWeekMin?: number;
+    /** Max tasks to add per week before advancing (default 10). */
+    mutationTasksPerWeekMax?: number;
+    /** Fill Mon–Sun for each task row. Default true. */
+    mutationFillAllDays?: boolean;
     /** Spacing between VU starts in ms (vuIndex * staggerMs). Default 0. */
     staggerMs?: number;
     /** Run virtual users one after another instead of in parallel. */
@@ -156,7 +186,6 @@ async function runVirtualUser(
         result.tFirstInteractionMs = tFirst - startedAt;
 
         if (opts.exerciseMutations) {
-            const dayIndex = opts.mutationDayIndex ?? 0;
             const hoursValue = opts.mutationHoursValue ?? '1';
             const tryRemove = opts.mutationTryRemove === true;
             const tryCopyLastWeek = opts.mutationTryCopyLastWeek === true;
@@ -167,6 +196,16 @@ async function runVirtualUser(
                     ok: name != null,
                     detail: name ? `Logged in as: ${name} (expected pool user ${user.email})` : 'could not read logged-in user',
                 };
+            });
+
+            await recordAction('selectTimesheetUser', async () => {
+                const name = await ui.loggedInUser();
+                const hints = [name, user.label, user.email.split('@')[0]].filter(Boolean) as string[];
+                for (const hint of hints) {
+                    const ok = await ui.selectTimesheetUserIfNeeded(hint);
+                    if (ok) return { ok: true, detail: `selected user matching "${hint}"` };
+                }
+                return { ok: true, detail: 'no User dropdown (employee self-service view)' };
             });
 
             await recordAction('preflightAddTask', async () => {
@@ -219,118 +258,193 @@ async function runVirtualUser(
             }
 
             const recordCount = Math.max(1, recordCountOverride ?? opts.mutationRecordCount ?? 1);
-            for (let rec = 0; rec < recordCount; rec++) {
-                const suffix = recordCount > 1 ? `#${rec + 1}` : '';
-                const cellDay = (dayIndex + rec) % 7;
+            const tasksPerWeekMin = opts.mutationTasksPerWeekMin ?? 9;
+            const tasksPerWeekMax = opts.mutationTasksPerWeekMax ?? 10;
+            const fillAllDays = opts.mutationFillAllDays !== false;
+            const weeklyBatches = splitIntoWeeklyBatches(recordCount, tasksPerWeekMin, tasksPerWeekMax);
 
-                const weekNav = await ui.advanceToWeekWithAvailableTasks();
-                if (weekNav.found && weekNav.weeksAdvanced > 0) {
+            let globalRec = 0;
+            for (let weekIdx = 0; weekIdx < weeklyBatches.length; weekIdx++) {
+                const batchSize = weeklyBatches[weekIdx]!;
+                const weekLabel = `W${weekIdx + 1}`;
+
+                let weekNav: Awaited<ReturnType<EmployeeInterfacePage['advanceToWeekWithAvailableTasks']>>;
+                if (weekIdx === 0) {
+                    weekNav = await ui.advanceToWeekWithAvailableTasks();
+                } else {
+                    if (await ui.isNextWeekEnabled()) {
+                        await ui.clickNextWeek();
+                        result.weekClickCount += 1;
+                    }
+                    const selection = await ui.trySelectTaskForAdd();
+                    weekNav = {
+                        found: selection != null,
+                        selection,
+                        taskKind: selection?.kind ?? null,
+                        weeksAdvanced: 1,
+                        direction: 'forward' as const,
+                    };
+                }
+
+                if (weekNav.found && weekNav.weeksAdvanced > 0 && weekIdx === 0) {
                     result.weekClickCount += weekNav.weeksAdvanced;
                 }
 
-                await recordAction(`ensureWeekHasTasks${suffix}`, async () => {
+                await recordAction(`ensureWeekHasTasks${weekLabel}`, async () => {
                     if (!weekNav.found || !weekNav.selection) {
                         return { ok: false, detail: 'exhausted week search — no selectable tasks' };
                     }
                     const hop =
-                        weekNav.weeksAdvanced > 0
+                        weekIdx === 0 && weekNav.weeksAdvanced > 0
                             ? `, ${weekNav.direction} ${weekNav.weeksAdvanced} week(s)`
-                            : '';
+                            : weekIdx > 0
+                              ? ', next week'
+                              : '';
                     const detail =
                         weekNav.selection.kind === 'non-project'
-                            ? `${weekNav.selection.label}${hop}`
-                            : `${weekNav.selection.project} / ${weekNav.selection.task}${hop}`;
+                            ? `${weekNav.selection.label}${hop} (${batchSize} tasks)`
+                            : `${weekNav.selection.project} / ${weekNav.selection.task}${hop} (${batchSize} tasks)`;
                     return { ok: true, detail };
                 });
 
                 if (!weekNav.found || !weekNav.selection) {
-                    throw new Error(`Record ${rec + 1}: no tasks available in any scanned week`);
+                    throw new Error(`Week ${weekIdx + 1}: no tasks available`);
                 }
 
-                let rowCountBefore = await ui.taskRowCount().catch(() => 0);
-                let usedProject = weekNav.selection.kind === 'project';
+                const rowStartBefore = await ui.taskRowCount().catch(() => 0);
+                const addedRows: number[] = [];
 
-                if (!usedProject) {
-                    const sel = weekNav.selection;
-                    await recordAction(`pickNonProjectTask${suffix}`, async () => ({
-                        ok: true,
-                        detail: `picked: ${sel.kind === 'non-project' ? sel.label : ''}`,
-                    }));
+                for (let t = 0; t < batchSize; t++) {
+                    globalRec++;
+                    const taskSuffix = batchSize > 1 ? `${weekLabel}#${t + 1}` : weekLabel;
 
-                    await recordAction(`clickAddTask${suffix}`, async () => {
-                        await ui.clickAddTask();
-                        return { ok: true };
-                    });
-                } else {
-                    const sel = weekNav.selection;
-                    await recordAction(`pickProjectTask${suffix}`, async () => ({
-                        ok: true,
-                        detail: `project=${sel.kind === 'project' ? sel.project : ''} task=${sel.kind === 'project' ? sel.task : ''}`,
-                    }));
-                    await recordAction(`clickAddTaskProject${suffix}`, async () => {
-                        await ui.clickAddTask();
-                        return { ok: true };
-                    });
-                }
-
-                let rowCountAfter = await ui.waitForTaskAdded(rowCountBefore);
-
-                if (!usedProject && rowCountAfter <= rowCountBefore && !(await ui.hasUnsavedChanges())) {
-                    const projectSel = await ui.trySelectProjectTaskForAdd();
-                    await recordAction(`pickProjectTask${suffix}`, async () => {
-                        if (!projectSel) {
-                            return { ok: false, detail: 'no project task available after non-project add failed' };
+                    if (t > 0) {
+                        const sel = await ui.trySelectTaskForAdd();
+                        if (!sel) {
+                            throw new Error(`Week ${weekIdx + 1} task ${t + 1}: no selectable task`);
                         }
-                        return { ok: true, detail: `project=${projectSel.project} task=${projectSel.task}` };
-                    });
-                    if (projectSel) {
-                        rowCountBefore = await ui.taskRowCount().catch(() => 0);
-                        await recordAction(`clickAddTaskProject${suffix}`, async () => {
+                        weekNav = { found: true, selection: sel, taskKind: sel.kind, weeksAdvanced: 0, direction: 'none' };
+                    }
+
+                    let rowCountBefore = await ui.taskRowCount().catch(() => 0);
+                    let usedProject = weekNav.selection!.kind === 'project';
+
+                    if (!usedProject) {
+                        const sel = weekNav.selection!;
+                        await recordAction(`pickNonProjectTask${taskSuffix}`, async () => ({
+                            ok: true,
+                            detail: `picked: ${sel.kind === 'non-project' ? sel.label : ''}`,
+                        }));
+
+                        await recordAction(`clickAddTask${taskSuffix}`, async () => {
                             await ui.clickAddTask();
                             return { ok: true };
                         });
-                        rowCountAfter = await ui.waitForTaskAdded(rowCountBefore);
-                        usedProject = true;
+                    } else {
+                        const sel = weekNav.selection!;
+                        await recordAction(`pickProjectTask${taskSuffix}`, async () => ({
+                            ok: true,
+                            detail: `project=${sel.kind === 'project' ? sel.project : ''} task=${sel.kind === 'project' ? sel.task : ''}`,
+                        }));
+                        await recordAction(`clickAddTaskProject${taskSuffix}`, async () => {
+                            await ui.clickAddTask();
+                            return { ok: true };
+                        });
                     }
+
+                    let rowCountAfter = await ui.waitForTaskAdded(rowCountBefore);
+
+                    if (!usedProject && rowCountAfter <= rowCountBefore && !(await ui.hasUnsavedChanges())) {
+                        const projectSel = await ui.trySelectProjectTaskForAdd();
+                        await recordAction(`pickProjectTask${taskSuffix}`, async () => {
+                            if (!projectSel) {
+                                return { ok: false, detail: 'no project task available after non-project add failed' };
+                            }
+                            return { ok: true, detail: `project=${projectSel.project} task=${projectSel.task}` };
+                        });
+                        if (projectSel) {
+                            rowCountBefore = await ui.taskRowCount().catch(() => 0);
+                            await recordAction(`clickAddTaskProject${taskSuffix}`, async () => {
+                                await ui.clickAddTask();
+                                return { ok: true };
+                            });
+                            rowCountAfter = await ui.waitForTaskAdded(rowCountBefore);
+                            usedProject = true;
+                        }
+                    }
+
+                    if (rowCountAfter <= rowCountBefore && !(await ui.hasUnsavedChanges())) {
+                        throw new Error(`Record ${globalRec}: task row was not added after pick + click`);
+                    }
+
+                    addedRows.push(Math.max(0, rowCountAfter - 1));
                 }
 
-                if (rowCountAfter <= rowCountBefore && !(await ui.hasUnsavedChanges())) {
-                    throw new Error(`Record ${rec + 1}: task row was not added after pick + click`);
-                }
+                const rowEnd = await ui.taskRowCount().catch(() => rowStartBefore);
 
-                const targetRow = Math.max(0, rowCountAfter - 1);
+                await recordAction(`fillCellHours${weekLabel}`, async () => {
+                    const rowsToFill =
+                        addedRows.length > 0
+                            ? addedRows
+                            : Array.from({ length: rowEnd - rowStartBefore }, (_, i) => rowStartBefore + i);
 
-                await recordAction(`fillCellHours${suffix}`, async () => {
+                    if (fillAllDays) {
+                        let totalFilled = 0;
+                        let totalExpected = 0;
+                        for (const row of rowsToFill) {
+                            for (let attempt = 0; attempt < 8; attempt++) {
+                                const filled = await ui.fillRowHoursAllDays(row, hoursValue);
+                                totalFilled += filled;
+                                totalExpected += 7;
+                                if (filled === 7) break;
+                                await page.waitForTimeout(400);
+                            }
+                        }
+                        return {
+                            ok: totalFilled === totalExpected,
+                            detail: `${rowsToFill.length} row(s), ${totalFilled}/${totalExpected} cells (Mon–Sun) value=${hoursValue}`,
+                        };
+                    }
+
+                    const cellDay = ((opts.mutationDayIndex ?? 0) + globalRec - 1) % 7;
+                    const targetRow = rowsToFill[rowsToFill.length - 1] ?? Math.max(0, rowEnd - 1);
                     for (let attempt = 0; attempt < 8; attempt++) {
                         const ok = await ui.fillCellHours(targetRow, cellDay, hoursValue);
                         if (ok) {
-                            return { ok: true, detail: `row=${targetRow} day=${cellDay} value=${hoursValue} (rows=${rowCountAfter})` };
+                            return {
+                                ok: true,
+                                detail: `row=${targetRow} day=${cellDay} value=${hoursValue} (rows=${rowEnd})`,
+                            };
                         }
                         await page.waitForTimeout(400);
                     }
                     const unsaved = await ui.hasUnsavedChanges();
                     return {
                         ok: false,
-                        detail: `row=${targetRow} day=${cellDay} value=${hoursValue} (rows=${rowCountAfter}, unsaved=${unsaved})`,
+                        detail: `row=${targetRow} day=${cellDay} value=${hoursValue} (rows=${rowEnd}, unsaved=${unsaved})`,
                     };
                 });
 
-                await recordAction(`save${suffix}`, async () => {
+                await recordAction(`save${weekLabel}`, async () => {
                     if (!(await ui.hasUnsavedChanges())) return { ok: false, detail: 'nothing to save' };
                     const { tSaveMs } = await ui.save();
-                    return { ok: true, detail: `${tSaveMs} ms` };
+                    return { ok: true, detail: `${batchSize} task(s), ${tSaveMs} ms` };
                 });
 
                 if (tryRemove) {
-                    await recordAction(`clickRemoveOnRow${suffix}`, async () => {
-                        const ok = await ui.clickRemoveOnRow(targetRow);
-                        return {
-                            ok,
-                            detail: ok
-                                ? `removed row=${targetRow}`
-                                : `remove blocked (validation: cannot remove rows with saved hours)`,
-                        };
-                    });
+                    for (let i = addedRows.length - 1; i >= 0; i--) {
+                        const row = addedRows[i]!;
+                        const rmSuffix = `${weekLabel}#${i + 1}`;
+                        await recordAction(`clickRemoveOnRow${rmSuffix}`, async () => {
+                            const ok = await ui.clickRemoveOnRow(row);
+                            return {
+                                ok,
+                                detail: ok
+                                    ? `removed row=${row}`
+                                    : `remove blocked (validation: cannot remove rows with saved hours)`,
+                            };
+                        });
+                    }
                 }
             }
         }
